@@ -1,161 +1,164 @@
-'use client';
+import { NextResponse } from 'next/server';
+import fs from 'fs';
+import path from 'path';
 
-import { useState, useEffect } from 'react';
-import { Upload } from 'lucide-react';
-import { TEMPLATES } from './config/templates';
-
-export default function Home() {
-  const [sourceImage, setSourceImage] = useState<File | null>(null);
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [selectedTemplate, setSelectedTemplate] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (sourceImage) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setImagePreview(reader.result as string);
-      };
-      reader.readAsDataURL(sourceImage);
-    } else {
-      setImagePreview(null);
+const TEMPLATES = [
+    {
+        id: 1,
+        name: "Wanted Poster",
+        price: 9.99,
+        targetImage: "/templates/wanted.jpg"
+    },
+    {
+        id: 2,
+        name: "Mona Lisa",
+        price: 14.99,
+        targetImage: "/templates/mona-lisa.jpg"
+    },
+    {
+        id: 3,
+        name: "Mugshot",
+        price: 4.99,
+        targetImage: "/templates/mugshot.jpg"
     }
-  }, [sourceImage]);
+];
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      if (file.size > 5 * 1024 * 1024) {
-        alert('File size should not exceed 5MB');
-        return;
-      }
-      setSourceImage(file);
-    }
-  };
-
-  const handleSubmit = async () => {
-    if (!sourceImage || !selectedTemplate) return;
-
-    const formData = new FormData();
-    formData.append('sourceImage', sourceImage);
-    formData.append('templateId', selectedTemplate.toString());
-
+export async function POST(req: Request) {
     try {
-      const response = await fetch('/api/face-swap', {
-        method: 'POST',
-        body: formData
-      });
+        if (!process.env.REPLICATE_API_TOKEN) {
+            throw new Error('REPLICATE_API_TOKEN is not configured');
+        }
 
-      const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error);
-      }
+        const formData = await req.formData();
+        const sourceImage = formData.get('sourceImage') as File;
+        const templateId = formData.get('templateId') as string;
 
-      console.log('Success:', data);
+        console.log('Request received:', {
+            sourceImageType: sourceImage?.type,
+            sourceImageSize: sourceImage?.size,
+            templateId
+        });
+
+        if (!sourceImage || !templateId) {
+            return NextResponse.json(
+                { error: 'Source image and template ID are required' },
+                { status: 400 }
+            );
+        }
+
+        // Находим шаблон
+        const template = TEMPLATES.find(t => t.id === parseInt(templateId));
+        if (!template) {
+            return NextResponse.json(
+                { error: 'Template not found' },
+                { status: 404 }
+            );
+        }
+
+        // Проверяем размер файла
+        if (sourceImage.size > 5 * 1024 * 1024) {
+            return NextResponse.json(
+                { error: 'File size should not exceed 5MB' },
+                { status: 400 }
+            );
+        }
+
+        // Конвертируем File в base64
+        const sourceBuffer = await sourceImage.arrayBuffer();
+        const sourceBase64 = Buffer.from(sourceBuffer).toString('base64');
+        const sourceDataUrl = `data:${sourceImage.type};base64,${sourceBase64}`;
+
+        // Читаем файл шаблона и конвертируем в base64
+        const templatePath = path.join(process.cwd(), 'public', template.targetImage);
+        const templateBuffer = await fs.promises.readFile(templatePath);
+        const templateBase64 = Buffer.from(templateBuffer).toString('base64');
+        const templateDataUrl = `data:image/jpeg;base64,${templateBase64}`;
+
+        console.log('Making request to Replicate API');
+
+        // Создаем запрос к Replicate API
+        const response = await fetch('https://api.replicate.com/v1/predictions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Token ${process.env.REPLICATE_API_TOKEN}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                version: "cff87316e31787df12002c9e20a78a017a36cb31fde9862d8dedd15ab29b7288",
+                input: {
+                    local_source: sourceDataUrl,
+                    local_target: templateDataUrl,
+                    weight: 0.5,
+                    cache_days: 10,
+                    det_thresh: 0.1,
+                }
+            })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || 'Failed to create prediction');
+        }
+
+        const prediction = await response.json();
+        console.log('Prediction created:', prediction);
+
+        // Ждем результат
+        let result = prediction;
+        let attempts = 0;
+        const maxAttempts = 30; // 30 секунд максимум
+
+        while (
+            attempts < maxAttempts &&
+            result.status !== 'succeeded' &&
+            result.status !== 'failed'
+            ) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            const pollResponse = await fetch(
+                `https://api.replicate.com/v1/predictions/${prediction.id}`,
+                {
+                    headers: {
+                        'Authorization': `Token ${process.env.REPLICATE_API_TOKEN}`,
+                    }
+                }
+            );
+
+            if (!pollResponse.ok) {
+                throw new Error('Failed to check prediction status');
+            }
+
+            result = await pollResponse.json();
+            console.log('Polling status:', result.status);
+            attempts++;
+        }
+
+        if (result.status === 'failed') {
+            throw new Error(result.error || 'Processing failed');
+        }
+
+        if (attempts >= maxAttempts) {
+            throw new Error('Processing timeout');
+        }
+
+        console.log('Final result:', result);
+
+        return NextResponse.json({
+            success: true,
+            result,
+            template: {
+                id: template.id,
+                name: template.name
+            }
+        });
+
     } catch (error) {
-      console.error('Error:', error);
-      alert('Failed to process image. Please try again.');
+        console.error('Face swap error:', error);
+        return NextResponse.json(
+            {
+                error: 'Failed to process image',
+                details: error instanceof Error ? error.message : 'Unknown error'
+            },
+            { status: 500 }
+        );
     }
-  };
-
-  return (
-    <main className="min-h-screen p-8 bg-gray-50">
-      <div className="max-w-4xl mx-auto">
-        <h1 className="text-4xl font-bold mb-8 text-center">Create Your Custom Poster</h1>
-        
-        {/* Upload Section */}
-        <div className="mb-8 p-6 bg-white rounded-lg shadow-lg">
-          <h2 className="text-2xl font-semibold mb-4">Upload Your Photo</h2>
-          <div className="border-2 border-dashed border-gray-300 rounded-lg p-8">
-            <div className="text-center">
-              {imagePreview ? (
-                <div className="mb-4">
-                  <div className="relative w-48 h-48 mx-auto mb-4">
-                    <img 
-                      src={imagePreview} 
-                      alt="Preview" 
-                      className="w-full h-full object-cover rounded"
-                    />
-                    <button 
-                      onClick={() => {
-                        setSourceImage(null);
-                        setImagePreview(null);
-                      }}
-                      className="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1 hover:bg-red-600"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  <p className="text-green-600">✓ {sourceImage?.name}</p>
-                </div>
-              ) : (
-                <div className="p-8 flex flex-col items-center">
-                  <Upload className="h-12 w-12 text-gray-400 mb-4" />
-                  <p className="text-gray-500">Drag and drop your photo here or click to browse</p>
-                </div>
-              )}
-              <input
-                type="file"
-                accept="image/*"
-                onChange={handleFileChange}
-                className="hidden"
-                id="photo-upload"
-              />
-              <label
-                htmlFor="photo-upload"
-                className="cursor-pointer bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 transition-colors"
-              >
-                {sourceImage ? 'Change Photo' : 'Choose Photo'}
-              </label>
-              <p className="text-sm text-gray-500 mt-2">
-                JPG, PNG. Maximum file size 5MB.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* Templates Section */}
-        <div className="mb-8 p-6 bg-white rounded-lg shadow-lg">
-          <h2 className="text-2xl font-semibold mb-4">Choose Template</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {TEMPLATES.map(template => (
-              <div
-                key={template.id}
-                className={`p-4 border rounded-lg cursor-pointer transition-all ${
-                  selectedTemplate === template.id
-                    ? 'border-blue-500 bg-blue-50'
-                    : 'border-gray-200 hover:border-blue-300'
-                }`}
-                onClick={() => setSelectedTemplate(template.id)}
-              >
-                <div className="relative aspect-w-3 aspect-h-4 mb-3">
-                  <img 
-                    src={template.targetImage} 
-                    alt={template.name}
-                    className="w-full h-full object-contain rounded"
-                  />
-                </div>
-                <h3 className="font-medium">{template.name}</h3>
-                <p className="text-gray-600">${template.price}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Submit Button */}
-        <div className="text-center">
-          <button
-            onClick={handleSubmit}
-            disabled={!sourceImage || !selectedTemplate}
-            className={`px-8 py-3 rounded-lg text-lg font-medium transition-colors ${
-              sourceImage && selectedTemplate
-                ? 'bg-green-500 text-white hover:bg-green-600'
-                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-            }`}
-          >
-            Create Poster
-          </button>
-        </div>
-      </div>
-    </main>
-  );
 }
